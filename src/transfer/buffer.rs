@@ -150,6 +150,36 @@ impl Buffer {
         self.len = 0;
     }
 
+    /// Shorten the initialized prefix without changing the allocation or requested length.
+    ///
+    /// A length greater than the current length has no effect. Bytes beyond the new
+    /// length are left untouched, so an OUT buffer can restore a previously initialized
+    /// prefix with [`Self::set_len`] after its transfer completes.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.len() {
+            self.len = len as u32;
+        }
+    }
+
+    /// Set the initialized prefix without writing bytes or changing the allocation.
+    ///
+    /// This does not change the requested length used for IN transfers.
+    ///
+    /// # Safety
+    /// When `len` is within capacity, every byte in `0..len` must be initialized.
+    /// Completion of an IN transfer only establishes initialization of the bytes
+    /// actually received.
+    /// An OUT transfer leaves previously initialized bytes unchanged.
+    ///
+    /// # Panics
+    /// Panics if `len` exceeds the buffer's capacity.
+    #[inline]
+    pub unsafe fn set_len(&mut self, len: usize) {
+        assert!(len <= self.capacity(), "length exceeds capacity");
+        self.len = len as u32;
+    }
+
     /// Extend the buffer by initializing `len` bytes to `value`, and get a
     /// mutable slice to the newly initialized bytes.
     ///
@@ -291,5 +321,57 @@ impl Drop for Buffer {
                 rustix::mm::munmap(self.ptr as *mut _, self.capacity as usize).unwrap();
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Buffer;
+
+    fn check_output_prefix(mut buffer: Buffer) {
+        buffer.extend_fill(64, 0x5a);
+        let pointer = buffer.as_ptr();
+        let requested = buffer.requested_len();
+        let capacity = buffer.capacity();
+        for used in [64, 7, 0, 31, 1] {
+            buffer.truncate(used);
+            assert_eq!(buffer.len(), used);
+            assert!(buffer.iter().all(|byte| *byte == 0x5a));
+            assert_eq!(buffer.as_ptr(), pointer);
+            assert_eq!(buffer.requested_len(), requested);
+            assert_eq!(buffer.capacity(), capacity);
+            buffer.truncate(capacity);
+            assert_eq!(buffer.len(), used);
+            // SAFETY: all 64 bytes were initialized above and truncation does not write them.
+            unsafe { buffer.set_len(64) };
+            assert!(buffer.iter().all(|byte| *byte == 0x5a));
+        }
+    }
+
+    #[test]
+    fn output_prefix_reuses_initialized_allocation() {
+        check_output_prefix(Buffer::new(64));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn output_prefix_keeps_mapped_storage() -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/zero")?;
+        let buffer = Buffer::mmap(&file.into(), 4096)?;
+        assert!(buffer.is_zero_copy());
+        check_output_prefix(buffer);
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "length exceeds capacity")]
+    fn initialized_length_cannot_exceed_capacity() {
+        let mut buffer = Buffer::new(8);
+        buffer.extend_fill(buffer.capacity(), 0);
+        // SAFETY: this deliberately exceeds capacity and must panic before changing the length.
+        unsafe { buffer.set_len(buffer.capacity() + 1) };
     }
 }
