@@ -41,7 +41,8 @@ use crate::{
     maybe_future::{blocking::Blocking, Ready},
     transfer::{
         internal::{
-            notify_completion, take_completed_from_queue, Idle, Notify, Pending, TransferFuture,
+            notify_completion, take_completed_from_queue, Idle, IdlePool, Notify, Pending,
+            TransferFuture,
         },
         Buffer, Completion, ControlIn, ControlOut, Direction, Recipient, TransferError,
     },
@@ -648,7 +649,7 @@ impl WindowsInterface {
             }),
             max_packet_size,
             pending: VecDeque::new(),
-            idle_transfer: None,
+            idle_transfers: IdlePool::new(),
         })
     }
 
@@ -829,7 +830,7 @@ pub(crate) struct WindowsEndpoint {
     /// A queue of pending transfers, expected to complete in order
     pending: VecDeque<Pending<TransferData>>,
 
-    idle_transfer: Option<Idle<TransferData>>,
+    idle_transfers: IdlePool<TransferData>,
 }
 
 struct EndpointInner {
@@ -847,6 +848,18 @@ impl WindowsEndpoint {
         self.pending.len()
     }
 
+    /// Prepares request storage without submitting or cancelling native work.
+    pub(crate) fn reserve_transfers(&mut self, count: usize) {
+        self.pending
+            .reserve(count.saturating_sub(self.pending.len()));
+        self.idle_transfers.reserve(count, self.pending.len(), || {
+            Idle::new(
+                self.inner.clone(),
+                TransferData::new(self.inner.interface.clone(), self.inner.address),
+            )
+        });
+    }
+
     pub(crate) fn cancel_all(&mut self) {
         // Cancel transfers in reverse order to ensure subsequent transfers
         // can't complete out of order while we're going through them.
@@ -856,7 +869,7 @@ impl WindowsEndpoint {
     }
 
     fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
-        let mut t = self.idle_transfer.take().unwrap_or_else(|| {
+        let mut t = self.idle_transfers.take_or_create(|| {
             Idle::new(
                 self.inner.clone(),
                 TransferData::new(self.inner.interface.clone(), self.inner.address),
@@ -882,7 +895,7 @@ impl WindowsEndpoint {
         self.inner.notify.subscribe(cx);
         if let Some(mut transfer) = take_completed_from_queue(&mut self.pending) {
             let completion = transfer.take_completion(&self.inner.interface);
-            self.idle_transfer = Some(transfer);
+            self.idle_transfers.recycle(transfer);
             Poll::Ready(completion)
         } else {
             Poll::Pending
@@ -893,7 +906,7 @@ impl WindowsEndpoint {
         self.inner.notify.wait_timeout(timeout, || {
             take_completed_from_queue(&mut self.pending).map(|mut transfer| {
                 let completion = transfer.take_completion(&self.inner.interface);
-                self.idle_transfer = Some(transfer);
+                self.idle_transfers.recycle(transfer);
                 completion
             })
         })

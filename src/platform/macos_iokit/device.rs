@@ -22,7 +22,8 @@ use crate::{
     maybe_future::blocking::Blocking,
     transfer::{
         internal::{
-            notify_completion, take_completed_from_queue, Idle, Notify, Pending, TransferFuture,
+            notify_completion, take_completed_from_queue, Idle, IdlePool, Notify, Pending,
+            TransferFuture,
         },
         Buffer, Completion, ControlIn, ControlOut, Direction, TransferError,
     },
@@ -658,7 +659,7 @@ impl MacInterface {
             }),
             max_packet_size,
             pending: VecDeque::new(),
-            idle_transfer: None,
+            idle_transfers: IdlePool::new(),
         })
     }
 
@@ -695,7 +696,7 @@ pub(crate) struct MacEndpoint {
     /// A queue of pending transfers, expected to complete in order
     pending: VecDeque<Pending<TransferData>>,
 
-    idle_transfer: Option<Idle<TransferData>>,
+    idle_transfers: IdlePool<TransferData>,
 }
 
 struct EndpointInner {
@@ -714,6 +715,15 @@ impl MacEndpoint {
         self.pending.len()
     }
 
+    /// Prepares request storage without submitting or cancelling native work.
+    pub(crate) fn reserve_transfers(&mut self, count: usize) {
+        self.pending
+            .reserve(count.saturating_sub(self.pending.len()));
+        self.idle_transfers.reserve(count, self.pending.len(), || {
+            Idle::new(self.inner.clone(), TransferData::new())
+        });
+    }
+
     pub(crate) fn cancel_all(&mut self) {
         let r = unsafe {
             call_iokit_function!(
@@ -729,9 +739,8 @@ impl MacEndpoint {
 
     fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
         let mut transfer = self
-            .idle_transfer
-            .take()
-            .unwrap_or_else(|| Idle::new(self.inner.clone(), TransferData::new()));
+            .idle_transfers
+            .take_or_create(|| Idle::new(self.inner.clone(), TransferData::new()));
         transfer.put_buffer(buffer, Direction::from_address(self.inner.address));
         transfer
     }
@@ -799,7 +808,7 @@ impl MacEndpoint {
         if let Some(mut transfer) = take_completed_from_queue(&mut self.pending) {
             let dir = Direction::from_address(self.inner.address);
             let completion = unsafe { transfer.take_completion(dir) };
-            self.idle_transfer = Some(transfer);
+            self.idle_transfers.recycle(transfer);
             Poll::Ready(completion)
         } else {
             Poll::Pending
@@ -811,7 +820,7 @@ impl MacEndpoint {
             take_completed_from_queue(&mut self.pending).map(|mut transfer| {
                 let dir = Direction::from_address(self.inner.address);
                 let completion = unsafe { transfer.take_completion(dir) };
-                self.idle_transfer = Some(transfer);
+                self.idle_transfers.recycle(transfer);
                 completion
             })
         })
